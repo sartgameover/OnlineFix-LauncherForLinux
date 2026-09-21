@@ -6,11 +6,11 @@ To launch the program, first open a terminal in the program folder.
 
 Run the following command:
 
-chmod +x Start.sh
+chmod +x start.sh
 
 Then launch the program with:
 
-bash ./Start.sh
+bash ./start.sh
 
 After launching, the main program window will open.
 
@@ -244,7 +244,7 @@ Keep the program updated to get access to new features.
 
 📌 QUICK START
 
-1. Run Start.sh.
+1. Run start.sh.
 2. Click «Add Game».
 3. Select the game folder.
 4. Select the required .exe file.
