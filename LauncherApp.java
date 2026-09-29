@@ -602,6 +602,7 @@ final class Game {
     String sgdbId = "";            // ID игры на SteamGridDB
     boolean favorite = false;
 
+    boolean useSteamOverlay = false; // Steam overlay через gameoverlayrenderer.so
     boolean useMangoHud = false;
     boolean useGameMode = false;
     boolean noEsync = false;
@@ -643,6 +644,7 @@ final class Game {
         m.put("steamStoreId", steamStoreId);
         m.put("sgdbId", sgdbId);
         m.put("favorite", favorite);
+        m.put("useSteamOverlay", useSteamOverlay);
         m.put("useMangoHud", useMangoHud);
         m.put("useGameMode", useGameMode);
         m.put("noEsync", noEsync);
@@ -690,6 +692,7 @@ final class Game {
         g.steamStoreId = Web.parseId(Json.str(m, "steamStoreId", "")) == 0 ? "" : Json.str(m, "steamStoreId", "").trim();
         g.sgdbId = Web.parseId(Json.str(m, "sgdbId", "")) == 0 ? "" : Json.str(m, "sgdbId", "").trim();
         g.favorite = Json.bool(m, "favorite", false);
+        g.useSteamOverlay = Json.bool(m, "useSteamOverlay", false);
         g.useMangoHud = Json.bool(m, "useMangoHud", false);
         g.useGameMode = Json.bool(m, "useGameMode", false);
         g.noEsync = Json.bool(m, "noEsync", false);
@@ -1915,6 +1918,7 @@ final class Runner {
         Path protonDir;   // null — системный Wine или сборка Wine
         Path wineDir;     // папка сборки Wine (не Proton), иначе null
         boolean needsDxvk; // выбран Vulkan, но DXVK в префиксе не установлен
+        boolean needsSteam; // включён оверлей Steam — Steam должен быть запущен
     }
 
     interface Listener {
@@ -2074,6 +2078,24 @@ final class Runner {
         }
         if (g.sendSteamAppId && g.steamAppId != null && g.steamAppId.matches("\\d{1,10}"))
             p.env.put("SteamAppId", g.steamAppId);
+        if (g.useSteamOverlay) {
+            List<Path> ov = SteamOverlay.libs();
+            if (ov.isEmpty()) {
+                p.warnings.add("Оверлей Steam включён, но gameoverlayrenderer.so не найден (нужен установленный Steam, не Flatpak) — игра запущена без оверлея.");
+            } else {
+                StringBuilder pre = new StringBuilder();
+                for (Path o : ov) { if (pre.length() > 0) pre.append(':'); pre.append(o); }
+                String oldPre = System.getenv("LD_PRELOAD");
+                if (oldPre != null && !oldPre.isBlank()) pre.append(':').append(oldPre);
+                p.env.put("LD_PRELOAD", pre.toString());
+                if (g.steamAppId != null && g.steamAppId.matches("\\d{1,10}")) {
+                    p.env.put("SteamGameId", g.steamAppId);
+                    p.env.put("SteamAppId", g.steamAppId);
+                }
+                p.needsSteam = true;
+                if (!SteamOverlay.steamRunning()) p.warnings.add("Оверлей Steam включён, но Steam не запущен — оверлей может не появиться.");
+            }
+        }
 
         for (String kv : Sys.tokenize(g.envVars)) {
             int eq = kv.indexOf('=');
@@ -2196,6 +2218,183 @@ final class Runner {
         waiter.setDaemon(true);
         waiter.start();
         return s;
+    }
+}
+
+/** Steam overlay: подгрузка gameoverlayrenderer.so из установленного Steam (Steam должен быть запущен). */
+final class SteamOverlay {
+    private SteamOverlay() {}
+
+    static List<Path> libs() {
+        Path r = Sys.steamRoot();
+        List<Path> res = new ArrayList<>();
+        for (String rel : new String[] {"ubuntu12_32/gameoverlayrenderer.so", "ubuntu12_64/gameoverlayrenderer.so"}) {
+            Path p = r.resolve(rel);
+            if (Files.isRegularFile(p)) res.add(p);
+        }
+        return res;
+    }
+
+    static boolean steamRunning() {
+        return ProcessHandle.allProcesses().anyMatch(ph ->
+            ph.info().command().map(c -> c.endsWith("/steam")).orElse(false));
+    }
+
+    /** Запускает Steam в фоне (без окна) и ждёт до 12 секунд. Вызывать не из потока интерфейса. */
+    static void startAndWait() {
+        if (steamRunning()) return;
+        String steam = Sys.which("steam");
+        if (steam == null) return;
+        try {
+            ProcessBuilder pb = new ProcessBuilder(steam, "-silent");
+            pb.redirectErrorStream(true);
+            pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
+            Sys.restoreDisplayEnv(pb.environment());
+            pb.start();
+        } catch (IOException e) {
+            return;
+        }
+        for (int i = 0; i < 24 && !steamRunning(); i++) {
+            try { Thread.sleep(500); } catch (InterruptedException e) { return; }
+        }
+        try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
+    }
+}
+
+/** Иконки из exe и ярлыки на рабочем столе / в меню приложений. */
+final class Shortcuts {
+    private Shortcuts() {}
+
+    static Path iconsDir() {
+        Path d = Store.dir().resolve("icons");
+        try { Files.createDirectories(d); } catch (IOException ignored) {}
+        return d;
+    }
+
+    static Path iconFile(Game g) {
+        return iconsDir().resolve(g.id + ".png");
+    }
+
+    static boolean hasIcon(Game g) {
+        return Files.isRegularFile(iconFile(g));
+    }
+
+    /** Достаёт самую большую иконку из exe (нужен icoextract; для BMP-иконок ещё и ffmpeg). */
+    static boolean extractIcon(Game g) {
+        Path out = iconFile(g);
+        if (Files.isRegularFile(out)) return true;
+        String ie = Sys.which("icoextract");
+        if (ie == null || g.executablePath == null || !g.executablePath.toLowerCase(Locale.ROOT).endsWith(".exe")) return false;
+        Path ico = iconsDir().resolve(g.id + ".ico");
+        Path one = iconsDir().resolve(g.id + ".one.ico");
+        try {
+            if (!exec(30, ie, g.executablePath, ico.toString()) || !Files.isRegularFile(ico)) return false;
+            byte[] d = Files.readAllBytes(ico);
+            int count = (d[4] & 0xff) | ((d[5] & 0xff) << 8);
+            int best = -1, bestSize = -1;
+            for (int i = 0; i < count && 6 + i * 16 + 16 <= d.length; i++) {
+                int o = 6 + i * 16;
+                int w = d[o] & 0xff; if (w == 0) w = 256;
+                int bytes = le32(d, o + 8);
+                if (w > bestSize && bytes > 0) { bestSize = w; best = i; }
+            }
+            if (best < 0) return false;
+            int o = 6 + best * 16;
+            int size = le32(d, o + 8), off = le32(d, o + 12);
+            if (off < 0 || size <= 0 || off + size > d.length) return false;
+            boolean png = size > 8 && (d[off] & 0xff) == 0x89 && d[off + 1] == 'P' && d[off + 2] == 'N' && d[off + 3] == 'G';
+            if (png) {
+                Files.write(out, Arrays.copyOfRange(d, off, off + size));
+                return true;
+            }
+            String ff = Sys.which("ffmpeg");
+            if (ff == null) return false;
+            byte[] single = new byte[22 + size];
+            single[2] = 1; single[4] = 1;                       // тип «иконка», одно изображение
+            System.arraycopy(d, o, single, 6, 12);              // ширина, высота, цвета, биты, размер данных
+            single[18] = 22;                                    // смещение данных
+            System.arraycopy(d, off, single, 22, size);
+            Files.write(one, single);
+            return exec(30, ff, "-y", "-loglevel", "error", "-i", one.toString(), "-frames:v", "1", out.toString())
+                && Files.isRegularFile(out);
+        } catch (IOException | RuntimeException e) {
+            return false;
+        } finally {
+            try { Files.deleteIfExists(ico); Files.deleteIfExists(one); } catch (IOException ignored) {}
+        }
+    }
+
+    private static int le32(byte[] d, int o) {
+        return (d[o] & 0xff) | ((d[o + 1] & 0xff) << 8) | ((d[o + 2] & 0xff) << 16) | ((d[o + 3] & 0xff) << 24);
+    }
+
+    private static boolean exec(int timeoutSec, String... cmd) {
+        try {
+            ProcessBuilder pb = new ProcessBuilder(cmd);
+            pb.redirectErrorStream(true);
+            pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
+            Process p = pb.start();
+            if (!p.waitFor(timeoutSec, java.util.concurrent.TimeUnit.SECONDS)) { p.destroyForcibly(); return false; }
+            return p.exitValue() == 0;
+        } catch (IOException e) {
+            return false;
+        } catch (InterruptedException e) {
+            return false;
+        }
+    }
+
+    static Path desktopDir() {
+        try {
+            if (Sys.which("xdg-user-dir") != null) {
+                Process p = new ProcessBuilder("xdg-user-dir", "DESKTOP").redirectErrorStream(true).start();
+                String s = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+                p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS);
+                if (!s.isEmpty() && Files.isDirectory(Paths.get(s))) return Paths.get(s);
+            }
+        } catch (IOException | InterruptedException ignored) {}
+        return Sys.HOME.resolve("Desktop");
+    }
+
+    static Path menuDir() {
+        String xdg = System.getenv("XDG_DATA_HOME");
+        Path base = (xdg != null && !xdg.isBlank()) ? Paths.get(xdg) : Sys.HOME.resolve(".local/share");
+        return base.resolve("applications");
+    }
+
+    static String fileName(Game g) {
+        return "ofll-" + g.id + ".desktop";
+    }
+
+    private static String content(Game g) throws IOException {
+        Path script = Paths.get(System.getProperty("user.dir"), "start.sh");
+        if (!Files.isRegularFile(script)) throw new IOException("Не найден start.sh рядом с лаунчером: " + script);
+        String sp = script.toString(), dir = script.getParent().toString();
+        for (String bad : new String[] {"\"", "\\", "$", "`", "\n"}) {
+            if (sp.contains(bad)) throw new IOException("В пути к лаунчеру есть недопустимый для ярлыка символ.");
+        }
+        String icon = hasIcon(g) ? iconFile(g).toString()
+            : (g.coverPath != null && Files.isRegularFile(Paths.get(g.coverPath)) ? g.coverPath : "applications-games");
+        String name = g.name.replace('\n', ' ').replace('\r', ' ').trim();
+        return "[Desktop Entry]\nType=Application\nVersion=1.0\nName=" + name
+            + "\nComment=OnlineFix Linux Launcher\nExec=\"" + sp.replace("%", "%%") + "\" --launch " + g.id
+            + "\nPath=" + dir + "\nIcon=" + icon + "\nTerminal=false\nCategories=Game;\n";
+    }
+
+    private static Path write(Path dir, Game g) throws IOException {
+        Files.createDirectories(dir);
+        Path f = dir.resolve(fileName(g));
+        Files.writeString(f, content(g), StandardCharsets.UTF_8);
+        f.toFile().setExecutable(true);
+        return f;
+    }
+
+    static Path createDesktop(Game g) throws IOException { return write(desktopDir(), g); }
+
+    static Path createMenu(Game g) throws IOException { return write(menuDir(), g); }
+
+    static void remove(Game g) {
+        try { Files.deleteIfExists(desktopDir().resolve(fileName(g))); } catch (IOException ignored) {}
+        try { Files.deleteIfExists(menuDir().resolve(fileName(g))); } catch (IOException ignored) {}
     }
 }
 
@@ -2672,6 +2871,27 @@ public class LauncherApp extends Application {
     }
 
     /** Показывает главное окно с плавным появлением и запускает появление карточек. */
+    private boolean launchArgHandled = false;
+
+    /** Ярлык игры: «start.sh --launch <id>» выбирает игру и сразу запускает её. */
+    private void runPendingLaunch() {
+        if (launchArgHandled) return;
+        launchArgHandled = true;
+        List<String> raw = getParameters().getRaw();
+        int i = raw.indexOf("--launch");
+        if (i < 0 || i + 1 >= raw.size()) return;
+        String id = raw.get(i + 1);
+        for (Game g : games) {
+            if (g.id.equals(id)) {
+                Platform.runLater(() -> {
+                    selectGame(g);
+                    onPlay(false);
+                });
+                return;
+            }
+        }
+    }
+
     private void showMainWindow() {
         boolean fade = config.animations;
         if (fade) primaryStage.setOpacity(0);
@@ -2683,6 +2903,7 @@ public class LauncherApp extends Application {
         uiReady = true;
         animatedCards.clear();
         refreshGrid();
+        runPendingLaunch();
         if (Store.lastError != null) {
             // showAndWait нельзя вызывать прямо из анимации — откладываем
             Platform.runLater(() -> showAlert(Alert.AlertType.WARNING, "Библиотека", Store.lastError));
@@ -4164,6 +4385,7 @@ public class LauncherApp extends Application {
         selectGame(g);
 
         if (config.autoCovers) enrichAsync(g, false);
+        CompletableFuture.runAsync(() -> Shortcuts.extractIcon(g));
 
         // авто-определение Epic Online Services и Xbox / Microsoft
         CompletableFuture.supplyAsync(() -> List.of(Epic.findEosFiles(root), Microsoft.findFiles(root), Gog.findFiles(root)))
@@ -4199,6 +4421,8 @@ public class LauncherApp extends Application {
             Runner.Session s = running.get(g.id);
             if (s != null) s.stop();
             deleteOwnCover(g);
+            Shortcuts.remove(g);
+            try { Files.deleteIfExists(Shortcuts.iconFile(g)); } catch (IOException ignored) {}
             games.remove(g);
             Store.saveGames(games);
             if (selected == g) selected = null;
@@ -4384,6 +4608,15 @@ public class LauncherApp extends Application {
     }
 
     private void startGame(Game g, boolean withConsole) {
+        if (g.useSteamOverlay && !SteamOverlay.libs().isEmpty() && !SteamOverlay.steamRunning() && Sys.which("steam") != null) {
+            setNotice("Запускаю Steam для оверлея…");
+            CompletableFuture.runAsync(SteamOverlay::startAndWait).thenRun(() -> Platform.runLater(() -> startGameNow(g, withConsole)));
+            return;
+        }
+        startGameNow(g, withConsole);
+    }
+
+    private void startGameNow(Game g, boolean withConsole) {
         DebugConsole console = withConsole ? new DebugConsole(g.name, themeUrl) : null;
         if (console != null) console.show();
         Runner.Listener listener = new Runner.Listener() {
@@ -4861,6 +5094,11 @@ public class LauncherApp extends Application {
         appIdFld.disableProperty().bind(cbAppId.selectedProperty().not());
         HBox appIdRow = new HBox(10, cbAppId, appIdFld);
         appIdRow.setAlignment(Pos.CENTER_LEFT);
+        CheckBox cbOverlay = new CheckBox("Оверлей Steam (Shift+Tab, нужен установленный Steam)");
+        cbOverlay.setSelected(g.useSteamOverlay);
+        if (SteamOverlay.libs().isEmpty()) {
+            Tooltip.install(cbOverlay, new Tooltip("gameoverlayrenderer.so не найден — установите Steam обычным пакетом (не Flatpak/Snap)."));
+        }
 
         CheckBox cbNet = new CheckBox("Разрешить доступ к сети (онлайн-режим)");
         cbNet.setSelected(g.networkAccess);
@@ -4903,13 +5141,44 @@ public class LauncherApp extends Application {
             new Separator(),
             styled("GOG Galaxy", "ofll-section"), cbGogOn, gogHint, cbGogSkip, gogButtons,
             new Separator(),
-            styled("Steam и сеть", "ofll-section"), appIdRow, cbNet,
+            styled("Steam и сеть", "ofll-section"), appIdRow, cbOverlay, cbNet,
             new Separator(),
             styled("Переопределения библиотек (WINEDLLOVERRIDES)", "ofll-section"), dllList, dllControls);
         steamEpic.setPadding(new Insets(16));
         ScrollPane steamScroll = new ScrollPane(steamEpic);
         steamScroll.setFitToWidth(true);
         Tab tabSteam = tab("Epic, Microsoft, GOG и Steam", steamScroll);
+
+        // ---- Ярлыки ----
+        Label scStatus = styled(Shortcuts.hasIcon(g) ? "Иконка игры извлечена из exe." : "Иконка ещё не извлечена"
+            + (Sys.which("icoextract") == null ? " (для извлечения установите icoextract)." : "."), "ofll-hint");
+        Button btnScIcon = button("Извлечь иконку из exe", "btn-surface");
+        btnScIcon.setOnAction(ev -> {
+            btnScIcon.setDisable(true);
+            CompletableFuture.supplyAsync(() -> Shortcuts.extractIcon(g)).thenAccept(ok -> Platform.runLater(() -> {
+                btnScIcon.setDisable(false);
+                scStatus.setText(ok ? "Иконка извлечена." : "Не удалось извлечь иконку: нужен icoextract (и ffmpeg для части иконок).");
+            }));
+        });
+        Button btnScDesk = button("Ярлык на рабочий стол", "btn-blue");
+        btnScDesk.setOnAction(ev -> {
+            try { scStatus.setText("Создан: " + Shortcuts.createDesktop(g)); }
+            catch (IOException e) { scStatus.setText("Ошибка: " + e.getMessage()); }
+        });
+        Button btnScMenu = button("Ярлык в меню приложений", "btn-blue");
+        btnScMenu.setOnAction(ev -> {
+            try { scStatus.setText("Создан: " + Shortcuts.createMenu(g)); }
+            catch (IOException e) { scStatus.setText("Ошибка: " + e.getMessage()); }
+        });
+        Button btnScDel = button("Удалить ярлыки", "btn-surface");
+        btnScDel.setOnAction(ev -> { Shortcuts.remove(g); scStatus.setText("Ярлыки удалены."); });
+        VBox shortcutsBox = new VBox(12,
+            styled("Ярлыки", "ofll-section"),
+            styled("Ярлык запускает игру через start.sh с параметром --launch: лаунчер откроется и сразу запустит эту игру.", "ofll-hint"),
+            new HBox(10, btnScDesk, btnScMenu, btnScDel), new Separator(),
+            styled("Иконка", "ofll-section"), btnScIcon, scStatus);
+        shortcutsBox.setPadding(new Insets(16));
+        Tab tabShortcuts = tab("Ярлыки", shortcutsBox);
 
         // ---- Пути ----
         TextField prefixFld = new TextField(g.winePrefix);
@@ -5035,7 +5304,7 @@ public class LauncherApp extends Application {
         data.setPadding(new Insets(16));
         Tab tabData = tab("Данные и обложка", data);
 
-        tabs.getTabs().addAll(tabBasic, tabGfx, tabProton, tabPerf, tabData, tabSteam, tabPaths);
+        tabs.getTabs().addAll(tabBasic, tabGfx, tabProton, tabPerf, tabData, tabSteam, tabShortcuts, tabPaths);
 
         Button btnSave = button("Сохранить", "btn-green");
         Button btnCancel = button("Отмена", "btn-surface");
@@ -5076,6 +5345,7 @@ public class LauncherApp extends Application {
             g.gogChecked = true;
             g.gogSkipPrompt = cbGogSkip.isSelected();
             g.sendSteamAppId = cbAppId.isSelected();
+            g.useSteamOverlay = cbOverlay.isSelected();
             if (!appId.isEmpty()) g.steamAppId = appId;
             g.networkAccess = cbNet.isSelected();
             g.dllOverrides = new ArrayList<>(dllList.getItems());
@@ -7649,4 +7919,3 @@ final class I18n {
         ));
     }
 }
-
